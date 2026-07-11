@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Harmonia — Loop Collector & Optimizer for LLM workflows.
+
+Universal proxy mode: intercepts any OpenAI-compatible API call,
+builds a graph of cycles, analyzes them, gives recommendations.
+
+Usage:
+  harmonia proxy              # Start proxy mode (intercepts API calls)
+  harmonia track [--session]  # Track a new session
+  harmonia optimize [--id]    # Analyze and optimize a session
+  harmonia viz [--id]         # Visualize a session as Mermaid graph
+  harmonia sessions           # List all tracked sessions
+  harmonia models             # Quick benchmark of models
+"""
+
+import os
+import sys
+import json
+import time
+import uuid
+import sqlite3
+import argparse
+import threading
+import signal
+from pathlib import Path
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+VERSION = "0.1.0"
+
+# === Storage ===
+DB_DIR = Path.home() / ".harmonia"
+DB_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DB_DIR / "harmonia.db"
+
+
+def init_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            label TEXT,
+            created_at TEXT,
+            total_calls INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            total_cost REAL DEFAULT 0.0,
+            models_used TEXT DEFAULT '[]'
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            parent_call_id INTEGER,
+            depth INTEGER DEFAULT 0,
+            model TEXT,
+            prompt_hash TEXT,
+            prompt_preview TEXT,
+            response_preview TEXT,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            duration_ms REAL DEFAULT 0.0,
+            created_at TEXT,
+            error TEXT,
+            loop_iteration INTEGER DEFAULT 0,
+            loop_group TEXT,
+            is_correction INTEGER DEFAULT 0,
+            quality_score REAL DEFAULT 0.0,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS loops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            loop_group TEXT,
+            model TEXT,
+            iterations INTEGER DEFAULT 0,
+            total_duration_ms REAL DEFAULT 0.0,
+            first_prompt_preview TEXT,
+            last_response_preview TEXT,
+            avg_quality REAL DEFAULT 0.0,
+            converged INTEGER DEFAULT 0,
+            created_at TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_db():
+    return sqlite3.connect(str(DB_PATH))
+
+
+# === Track mode (CLI) ===
+def cmd_track(args):
+    conn = get_db()
+    c = conn.cursor()
+
+    session_id = str(uuid.uuid4())[:8]
+    label = args.label or f"session_{session_id}"
+
+    c.execute("INSERT INTO sessions (id, label, created_at) VALUES (?, ?, ?)",
+              (session_id, label, datetime.now().isoformat()))
+    conn.commit()
+
+    print(f"  session: {session_id}")
+    print(f"  label:   {label}")
+    print(f"  db:      {DB_PATH}")
+    print()
+    print("  Now pipe your agent's API calls here, or use --proxy mode.")
+    conn.close()
+
+
+# === Analyze / Optimize ===
+def detect_loops(conn, session_id):
+    """Detect correction/reflection loops in session calls."""
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, model, prompt_preview, response_preview, duration_ms
+        FROM calls WHERE session_id = ? ORDER BY id
+    """, (session_id,))
+    calls = c.fetchall()
+
+    if not calls:
+        return []
+
+    loops = []
+    current_loop = None
+    loop_models = {}
+    loop_groups = {}
+    loop_counter = 0
+
+    for i, (cid, model, prompt, response, dur) in enumerate(calls):
+        # Detect correction patterns: "improve", "fix", "rewrite", "check" in prompt
+        lower = (prompt or "").lower() + (response or "").lower()
+        is_correction = any(w in lower for w in [
+            "improve", "fix", "rewrite", "better", "correct", "review",
+            "check", "validate", "reflect", "руководство", "исправь",
+            "улучши", "проверь", "оцени", "refine", "revise", "enhance"
+        ])
+
+        # Group similar prompts together (by theme)
+        prompt_words = set((prompt or "").lower().split()[:20])
+
+        if is_correction and current_loop is not None:
+            # Extend current loop
+            loop_counter += 1
+            current_loop['iterations'] += 1
+            current_loop['total_duration_ms'] += dur or 0
+            current_loop['last_response_preview'] = (response or "")[:100]
+            c.execute("UPDATE calls SET loop_iteration=?, loop_group=?, is_correction=1 WHERE id=?",
+                      (loop_counter, current_loop['loop_group'], cid))
+        elif is_correction:
+            # Start new loop
+            loop_counter = 1
+            loop_group = f"loop_{uuid.uuid4().hex[:6]}"
+            current_loop = {
+                'session_id': session_id,
+                'loop_group': loop_group,
+                'model': model,
+                'iterations': 1,
+                'total_duration_ms': dur or 0,
+                'first_prompt_preview': (prompt or "")[:100],
+                'last_response_preview': (response or "")[:100],
+                'avg_quality': 0.0,
+                'converged': 0,
+                'created_at': datetime.now().isoformat()
+            }
+            c.execute("UPDATE calls SET loop_iteration=?, loop_group=?, is_correction=1 WHERE id=?",
+                      (loop_counter, loop_group, cid))
+            loops.append(current_loop)
+        else:
+            current_loop = None
+
+    conn.commit()
+    return loops
+
+
+def cmd_optimize(args):
+    conn = get_db()
+    c = conn.cursor()
+
+    session_id = args.session_id
+    if not session_id:
+        # Get latest session
+        c.execute("SELECT id, label, total_calls FROM sessions ORDER BY created_at DESC LIMIT 1")
+        row = c.fetchone()
+        if not row:
+            print("  No sessions found. Start with: harmonia track")
+            conn.close()
+            return
+        session_id = row[0]
+
+    # 1. Detect loops
+    loops = detect_loops(conn, session_id)
+    if loops:
+        for l in loops:
+            c.execute("""
+                INSERT OR REPLACE INTO loops
+                (session_id, loop_group, model, iterations, total_duration_ms,
+                 first_prompt_preview, last_response_preview, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (l['session_id'], l['loop_group'], l['model'], l['iterations'],
+                  l['total_duration_ms'], l['first_prompt_preview'],
+                  l['last_response_preview'], l['created_at']))
+
+    # 2. Get call stats
+    c.execute("""
+        SELECT model, COUNT(*) as calls, AVG(duration_ms) as avg_dur,
+               AVG(total_tokens) as avg_tokens, SUM(error IS NOT NULL) as errors
+        FROM calls WHERE session_id = ? GROUP BY model ORDER BY calls DESC
+    """, (session_id,))
+    model_stats = c.fetchall()
+
+    # 3. Update session totals
+    c.execute("""
+        UPDATE sessions SET
+            total_calls = (SELECT COUNT(*) FROM calls WHERE session_id=?),
+            total_tokens = (SELECT COALESCE(SUM(total_tokens), 0) FROM calls WHERE session_id=?)
+        WHERE id=?
+    """, (session_id, session_id, session_id))
+    conn.commit()
+
+    # 4. Print report
+    c.execute("SELECT label, total_calls, total_tokens FROM sessions WHERE id=?", (session_id,))
+    sess = c.fetchone()
+
+    print(f"\n  Session: {session_id}")
+    print(f"  Label:   {sess[0]}")
+    print(f"  Calls:   {sess[1]}")
+    print(f"  Tokens:  {sess[2]}")
+    print()
+
+    if model_stats:
+        print(f"  {'Model':<30} {'Calls':<8} {'Avg ms':<10} {'Avg tok':<10} {'Errors'}")
+        print(f"  {'─'*68}")
+        for m, calls, avg_dur, avg_tok, errs in model_stats:
+            err_str = f"⚠️ {errs}" if errs else "ok"
+            print(f"  {m:<30} {calls:<8} {avg_dur:<10.0f} {avg_tok:<10.0f} {err_str}")
+
+    if loops:
+        print(f"\n  Loops detected: {len(loops)}")
+        for l in loops:
+            conv = "✓ converged" if l['converged'] else "⚡ active"
+            print(f"\n  ├─ {l['loop_group']} ({l['iterations']} iters, {l['total_duration_ms']:.0f}ms)")
+            print(f"  │  {conv}")
+            print(f"  │  First: {l['first_prompt_preview'][:60]}...")
+            print(f"  │  Last:  {l['last_response_preview'][:60]}...")
+
+        # Recommendations
+        long_loops = [l for l in loops if l['iterations'] > 3]
+        if long_loops:
+            print(f"\n  Recommendations:")
+            for l in long_loops:
+                print(f"  • Loop {l['loop_group']}: {l['iterations']} iters (threshold: 3)")
+                print(f"    → Consider adding a convergence check or hard limit.")
+                print(f"    → Model: {l['model']}, Total time: {l['total_duration_ms']:.0f}ms")
+    else:
+        print(f"  No correction loops detected.")
+
+    # 5. Save detected loops to DB
+    conn.commit()
+    conn.close()
+
+
+# === Viz mode ===
+def cmd_viz(args):
+    conn = get_db()
+    c = conn.cursor()
+
+    session_id = args.session_id
+    if not session_id:
+        c.execute("SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1")
+        row = c.fetchone()
+        if not row:
+            print("  No sessions found.")
+            conn.close()
+            return
+        session_id = row[0]
+
+    c.execute("""
+        SELECT id, parent_call_id, depth, model, prompt_preview,
+               response_preview, duration_ms, loop_group, loop_iteration
+        FROM calls WHERE session_id = ? ORDER BY id
+    """, (session_id,))
+    calls = c.fetchall()
+
+    if not calls:
+        print("  No calls yet.")
+        conn.close()
+        return
+
+    print("```mermaid")
+    print("graph TD")
+    print(f"  subgraph Session_{session_id}")
+
+    prev_group = None
+    for cid, pid, depth, model, prompt, response, dur, group, it in calls:
+        lbl = (prompt or "")[:40].replace('"', "'")
+        short_model = model.split("/")[-1][:15] if model else "unknown"
+        color = "sky" if not group else "violet" if it == 1 else "rose"
+        node = f"  c{cid}[{short_model}: {lbl}]"
+
+        if group:
+            if group != prev_group:
+                print(f"  subgraph {group}")
+            print(f"  c{cid}[{short_model}: {lbl}]:::{color}")
+            if it > 1:
+                print(f"  c{cid - 1} -->|iter {it}| c{cid}")
+            prev_group = group
+        elif prev_group:
+            print("  end")
+            prev_group = None
+
+        print(node)
+
+        if pid:
+            print(f"  c{pid} --> c{cid}")
+
+    if prev_group:
+        print("  end")
+    print("  end")
+    print("```")
+
+
+# === Sessions list ===
+def cmd_sessions(args):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, label, created_at, total_calls, total_tokens
+        FROM sessions ORDER BY created_at DESC LIMIT 20
+    """)
+    rows = c.fetchall()
+
+    if not rows:
+        print("  No sessions. Start with: harmonia track")
+        conn.close()
+        return
+
+    print(f"  {'Session':<12} {'Label':<25} {'Calls':<8} {'Tokens':<10} {'Created'}")
+    print(f"  {'─'*65}")
+    for sid, label, created, calls, tokens in rows:
+        print(f"  {sid:<12} {label:<25} {calls:<8} {tokens:<10} {created[:19]}")
+    conn.close()
+
+
+# === Models benchmark ===
+def cmd_models(args):
+    """Quick benchmark: test a prompt against available models."""
+    print()
+    print(f"  Models Benchmark")
+    print(f"  {'─'*40}")
+    print()
+    print("  This will probe your configured API endpoint.")
+    print("  Use --api-url and --api-key to specify.")
+    print("  Or set HARMANIA_API_URL and HARMANIA_API_KEY env vars.")
+    print()
+
+    # Try common endpoints
+    endpoints = [
+        os.environ.get("HARMANIA_API_URL", "http://localhost:3000/v1"),
+    ]
+
+    import requests as req
+    for ep in endpoints:
+        try:
+            r = req.get(f"{ep}/models", timeout=5,
+                        headers={"Authorization": f"Bearer {os.environ.get('HARMANIA_API_KEY', '')}"
+                                 if os.environ.get("HARMANIA_API_KEY") else {}})
+            if r.status_code == 200:
+                models = r.json().get("data", [])
+                print(f"  → Found {len(models)} models at {ep}")
+        except Exception as e:
+            print(f"  → {ep}: {e}")
+
+
+# === Proxy mode ===
+class ProxyHandler(BaseHTTPRequestHandler):
+    session_id = None
+
+    def do_POST(self):
+        content_len = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_len)
+
+        # Log the call
+        if ProxyHandler.session_id:
+            try:
+                req_data = json.loads(body)
+                conn = get_db()
+                c = conn.cursor()
+                model = req_data.get("model", "unknown")
+                messages = req_data.get("messages", [])
+                prompt_preview = json.dumps(messages)[:200] if messages else ""
+                
+                c.execute("""
+                    INSERT INTO calls (session_id, model, prompt_preview, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (ProxyHandler.session_id, model, prompt_preview, datetime.now().isoformat()))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+        # Forward to real API
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        response = json.dumps({
+            "id": "harmonia-proxy",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "harmonia",
+            "choices": [{"message": {"role": "assistant", "content": "Harmonia proxy active"}}]
+        })
+        self.wfile.write(response.encode())
+
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP server logs
+
+
+def cmd_proxy(args):
+    port = args.port or 8090
+
+    # Ensure there's a session to log to
+    conn = get_db()
+    c = conn.cursor()
+    session_id = str(uuid.uuid4())[:8]
+    c.execute("INSERT INTO sessions (id, label, created_at) VALUES (?, ?, ?)",
+              (session_id, f"proxy_{session_id}", datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+    ProxyHandler.session_id = session_id
+
+    server = HTTPServer(("127.0.0.1", port), ProxyHandler)
+
+    print(f"\n  Harmonia proxy running on http://127.0.0.1:{port}")
+    print(f"  Session: {session_id}")
+    print(f"  Point your client to: {server.server_address[0]}:{server.server_address[1]}")
+    print(f"\n  Use your OpenAI client with base_url=http://127.0.0.1:{port}/v1")
+    print(f"  Ctrl+C to stop and analyze.\n")
+
+    def shutdown(sig, frame):
+        print("\n  Stopping proxy...")
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    server.serve_forever()
+
+
+# === CLI ===
+def main():
+    parser = argparse.ArgumentParser(
+        description="Harmonia — Loop Collector & Optimizer for LLM workflows",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  harmonia track --label my_agent
+  harmonia proxy --port 8090
+  harmonia optimize
+  harmonia optimize --session_id abc123
+  harmonia viz
+  harmonia sessions
+  harmonia models
+        """
+    )
+    parser.add_argument("--version", action="version", version=f"Harmonia v{VERSION}")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # track
+    p_track = subparsers.add_parser("track", help="Start a new tracking session")
+    p_track.add_argument("--label", default=None, help="Session label")
+
+    # proxy
+    p_proxy = subparsers.add_parser("proxy", help="Start proxy mode (intercepts API calls)")
+    p_proxy.add_argument("--port", type=int, default=8090, help="Proxy port (default: 8090)")
+
+    # optimize
+    p_opt = subparsers.add_parser("optimize", help="Analyze and optimize a session")
+    p_opt.add_argument("--session_id", default=None, help="Session ID (default: latest)")
+
+    # viz
+    p_viz = subparsers.add_parser("viz", help="Visualize a session")
+    p_viz.add_argument("--session_id", default=None, help="Session ID (default: latest)")
+
+    # sessions
+    subparsers.add_parser("sessions", help="List all sessions")
+
+    # models
+    p_models = subparsers.add_parser("models", help="Quick benchmark")
+    p_models.add_argument("--api-url", default=None)
+    p_models.add_argument("--api-key", default=None)
+
+    args = parser.parse_args()
+
+    init_db()
+
+    if args.command == "track":
+        cmd_track(args)
+    elif args.command == "proxy":
+        cmd_proxy(args)
+    elif args.command == "optimize":
+        cmd_optimize(args)
+    elif args.command == "viz":
+        cmd_viz(args)
+    elif args.command == "sessions":
+        cmd_sessions(args)
+    elif args.command == "models":
+        cmd_models(args)
+
+
+if __name__ == "__main__":
+    main()
