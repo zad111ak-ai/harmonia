@@ -12,6 +12,12 @@ No cloud, no SaaS, no config fatigue. One binary, one database, one command.
 
 LLM agents run thousands of API calls. Many of those calls are correction loops — the agent asks, checks, fixes, asks again, fixes again. Each iteration costs time and tokens. But nobody can see inside those loops.
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"/></a>
+  <img src="https://img.shields.io/badge/python-3.8+-green?style=flat-square" alt="Python 3.8+"/>
+  <a href=".github/FUNDING.yml"><img src="https://img.shields.io/badge/sponsor-donate-purple?style=flat-square" alt="Sponsor"/></a>
+</p>
+
 Harmonia gives you X-ray vision into your agent's internals:
 
 - How many iterations per loop?
@@ -75,6 +81,21 @@ export HARMANIA_API_KEY=sk-...
 ```
 
 Or use the proxy mode to transparently intercept traffic without modifying your client code.
+
+---
+
+## Support
+
+If Harmonia saves you time, consider a donation:
+
+| Asset | Address |
+|---|---|
+| **TON** | `UQBLEYICSbxKZAajJspddpVYEFtvCcnp7gUpHDZpTChqqAoC` |
+| **USDT (TON)** | `UQAoI2i8P9-JeZhvGSUwKnymVyY5cb-1Rg7pdqoWMNena7DP` |
+| **Ethereum (ERC-20)** | `0xD26f0efE6A8F11e127c3Af3D6163BD458a1693c3` |
+| **Bitcoin** | `bc1qd8sa7e4f696wmcyszuxh9snqt2n66zrhz9g80j` |
+
+Or just star the repo — that helps too!
 
 ---
 
