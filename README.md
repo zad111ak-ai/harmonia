@@ -6,6 +6,8 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-green?style=flat-square)](https://python.org)
+[![GitHub stars](https://img.shields.io/github/stars/zad111ak-ai/harmonia?style=social)](https://github.com/zad111ak-ai/harmonia)
+[![GitHub contributors](https://img.shields.io/github/contributors/zad111ak-ai/harmonia)](https://github.com/zad111ak-ai/harmonia/graphs/contributors)
 
 **Loop collector and optimizer for LLM workloads.**
 
